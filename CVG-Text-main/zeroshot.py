@@ -2,7 +2,7 @@ import warnings
 warnings.filterwarnings("ignore")
 import os
 import sys
-from dataset import OSMTextImageDataset
+from dataset import load_text_image_dataset
 import torch
 from torch.utils.data import DataLoader
 import argparse
@@ -66,7 +66,7 @@ if __name__ == "__main__":
                                                 )
     
 
-    dataset = OSMTextImageDataset(root_dir, testset_path, preprocessor=preprocessor)
+    dataset = load_text_image_dataset(testset_path, root_dir, preprocessor=preprocessor)
     dataloader = DataLoader(dataset, batch_size=4, num_workers=4, shuffle=False)
     print(args)
     print("Test Image Num:", len(dataset))
