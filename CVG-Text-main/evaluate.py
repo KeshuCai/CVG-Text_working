@@ -6,6 +6,9 @@ import csv
 from math import radians, sin, cos, sqrt, atan2
 import re
 import json
+import time
+import datetime
+import gc
 from torch.nn import functional as F
 from transformers import ViltProcessor
 
@@ -721,5 +724,140 @@ def cal_score(similarities, image_filenames_list, text_filenames_list, texts_lis
         print(f"Top 5 matching information saved to {output_csv_path}")
 
     return overall_metrics['R@1'], overall_metrics['R@5'], overall_metrics['R@10']
+
+
+@torch.no_grad()
+def evaluation(model, data_loader, tokenizer, device, config):
+    """Compute similarity and ITM scores for the given ``data_loader``.
+
+    This function mirrors the evaluation procedure used in BLIP/ALBEF. It
+    returns two score matrices for image-to-text and text-to-image retrieval.
+    """
+
+    model = model.half().eval()
+
+    texts = data_loader.dataset.text
+    num_text = len(texts)
+    text_bs = config.get('batch_size_test_text', 256)
+
+    text_feats, text_embeds, text_atts = [], [], []
+    for i in range(0, num_text, text_bs):
+        text = texts[i: min(num_text, i + text_bs)]
+        text_input = tokenizer(text, padding='max_length', truncation=True,
+                               max_length=config.get('max_tokens', 64),
+                               return_tensors='pt').to(device)
+
+        text_output = model.text_encoder(text_input.input_ids,
+                                         attention_mask=text_input.attention_mask,
+                                         mode='text')
+        feat = text_output.last_hidden_state
+        embed = F.normalize(model.text_proj(feat[:, 0, :]))
+
+        text_embeds.append(embed)
+        text_feats.append(feat)
+        text_atts.append(text_input.attention_mask)
+
+    text_embeds = torch.cat(text_embeds, dim=0)
+    text_feats = torch.cat(text_feats, dim=0)
+    text_atts = torch.cat(text_atts, dim=0)
+
+    image_feats = []
+    image_embeds = []
+    for images, _ in data_loader:
+        images = images.to(torch.float16).to(device)
+        with torch.autocast('cuda', dtype=torch.float16):
+            image_feat = model.vision_encoder(images)
+        image_feat = image_feat.half()
+        feat_slice = image_feat[:, 0, :]
+        image_embed = F.normalize(model.vision_proj(feat_slice), dim=-1)
+
+        image_feats.append(image_feat)
+        image_embeds.append(image_embed)
+
+    image_feats = torch.cat(image_feats, dim=0)
+    image_embeds = torch.cat(image_embeds, dim=0)
+
+    sims_matrix = image_embeds @ text_embeds.t()
+
+    score_matrix_i2t = torch.full((len(data_loader.dataset.image), len(texts)),
+                                  -100.0, dtype=torch.float16).to(device)
+
+    for i, sims in enumerate(sims_matrix):
+        topk_sim, topk_idx = sims.topk(k=config.get('k_test', 128), dim=0)
+        encoder_output = image_feats[i].repeat(topk_idx.size(0), 1, 1).to(device)
+        encoder_att = torch.ones(encoder_output.size()[:-1], dtype=torch.long).to(device)
+        output = model.text_encoder(encoder_embeds=text_feats[topk_idx],
+                                    attention_mask=text_atts[topk_idx],
+                                    encoder_hidden_states=encoder_output,
+                                    encoder_attention_mask=encoder_att,
+                                    return_dict=True,
+                                    mode='fusion')
+        score = model.itm_head(output.last_hidden_state[:, 0, :])[:, 1]
+        score_matrix_i2t[i, topk_idx] = score
+
+    score_matrix_i2t_c = score_matrix_i2t.cpu().numpy()
+    sims_matrix = sims_matrix.t()
+    score_matrix_t2i = torch.full((len(texts), len(data_loader.dataset.image)),
+                                  -100.0, dtype=torch.float16).to(device)
+
+    for i, sims in enumerate(sims_matrix):
+        topk_sim, topk_idx = sims.topk(k=config.get('k_test', 128), dim=0)
+        encoder_output = image_feats[topk_idx].to(device)
+        encoder_att = torch.ones(encoder_output.size()[:-1], dtype=torch.long).to(device)
+        output = model.text_encoder(encoder_embeds=text_feats[i].repeat(topk_idx.size(0), 1, 1),
+                                    attention_mask=text_atts[i].repeat(topk_idx.size(0), 1),
+                                    encoder_hidden_states=encoder_output,
+                                    encoder_attention_mask=encoder_att,
+                                    return_dict=True,
+                                    mode='fusion')
+        score = model.itm_head(output.last_hidden_state[:, 0, :])[:, 1]
+        score_matrix_t2i[i, topk_idx] = score
+
+    return score_matrix_i2t_c, score_matrix_t2i.cpu().numpy()
+
+
+@torch.no_grad()
+def itm_eval(scores_i2t, scores_t2i, txt2img, img2txt, img2building):
+    """Compute recall metrics using building level annotations."""
+
+    ranks = np.zeros(scores_i2t.shape[0])
+    for index, score in enumerate(scores_i2t):
+        inds = np.argsort(score)[::-1]
+        for i in range(len(inds)):
+            inds[i] = img2building[txt2img[inds[i]]]
+        target = np.where(inds == img2building[index])[0]
+        ranks[index] = target[0]
+
+    tr1 = 100.0 * len(np.where(ranks < 1)[0]) / len(ranks)
+    tr5 = 100.0 * len(np.where(ranks < 5)[0]) / len(ranks)
+    tr10 = 100.0 * len(np.where(ranks < 10)[0]) / len(ranks)
+
+    ranks = np.zeros(scores_t2i.shape[0])
+    for index, score in enumerate(scores_t2i):
+        inds = np.argsort(score)[::-1]
+        for i in range(len(inds)):
+            inds[i] = img2building[inds[i]]
+        building = img2building[txt2img[index]]
+        ranks[index] = np.where(inds == building)[0][0]
+
+    ir1 = 100.0 * len(np.where(ranks < 1)[0]) / len(ranks)
+    ir5 = 100.0 * len(np.where(ranks < 5)[0]) / len(ranks)
+    ir10 = 100.0 * len(np.where(ranks < 10)[0]) / len(ranks)
+
+    tr_mean = (tr1 + tr5 + tr10) / 3
+    ir_mean = (ir1 + ir5 + ir10) / 3
+    r_mean = (tr_mean + ir_mean) / 2
+
+    return {
+        'txt_r1': tr1,
+        'txt_r5': tr5,
+        'txt_r10': tr10,
+        'txt_r_mean': tr_mean,
+        'img_r1': ir1,
+        'img_r5': ir5,
+        'img_r10': ir10,
+        'img_r_mean': ir_mean,
+        'r_mean': r_mean,
+    }
 
 

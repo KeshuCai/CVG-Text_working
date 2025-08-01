@@ -12,7 +12,7 @@ import torch.distributed as dist
 import warnings
 warnings.filterwarnings("ignore")
 
-from dataset import OSMTextImageDataset
+from dataset import load_text_image_dataset
 from utils import setup_logging
 from model_loader import load_model
 
@@ -101,13 +101,13 @@ if __name__ == "__main__":
         trainset_path = [trainset_path.replace('-mixed', ''), trainset_path.replace('-mixed', '-photos')]
         testset_path = [testset_path.replace('-mixed', ''), testset_path.replace('-mixed', '-photos')]
         root_dir = [root_dir.replace('-mixed', ''), root_dir.replace('-mixed', '-photos')]
-    testset = OSMTextImageDataset(root_dir, testset_path, processor=preprocessor)
+    testset = load_text_image_dataset(testset_path, root_dir, processor=preprocessor)
     testloader = DataLoader(testset, batch_size=16, num_workers=4, shuffle=False)
 
     global_batch_size = args.batch_size
     local_batch_size = global_batch_size // world_size 
 
-    trainset = OSMTextImageDataset(root_dir, trainset_path, processor=preprocessor)
+    trainset = load_text_image_dataset(trainset_path, root_dir, processor=preprocessor)
     sampler = DistributedSampler(trainset,rank=rank)
     trainloader = DataLoader(trainset, batch_size=local_batch_size, sampler=sampler,num_workers=4,pin_memory=True)
     

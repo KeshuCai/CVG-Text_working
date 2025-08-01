@@ -59,7 +59,16 @@ pip install -r requirements.txt
 
 ## 🤗 Dataset Download and Path Configuration
 
-**Dataset：** The images and annotation files for CVG-Text can be found at 
+**Dataset：** The images and annotation files for CVG-Text can be found at
+our [Hugging Face repository](https://huggingface.co/datasets/CVG-Text/CVG-Text).
+For experiments on the Cross-Modal Drone Navigation challenge you can download
+the dataset from
+[robosense/datasets](https://huggingface.co/datasets/robosense/datasets/tree/main/track4-cross-modal-drone-navigation):
+
+```bash
+huggingface-cli download robosense/datasets track4-cross-modal-drone-navigation \
+    --local-dir /path/to/track4-dataset
+```
 
 **Path Configuration：** After downloading, update the `/path/to/dataset/` in `./config.yaml` with the actual dataset paths.
 
